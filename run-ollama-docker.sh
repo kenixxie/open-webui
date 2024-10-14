@@ -1,7 +1,7 @@
 #!/bin/bash
 
-host_port=11434
-container_port=11434
+host_port=3336
+container_port=3336
 
 read -r -p "Do you want ollama in Docker with GPU support? (y/n): " use_gpu
 
