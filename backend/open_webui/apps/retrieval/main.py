@@ -23,11 +23,13 @@ from open_webui.apps.retrieval.vector.connector import VECTOR_DB_CLIENT
 
 # Document loaders
 from open_webui.apps.retrieval.loaders.main import Loader
+from open_webui.apps.retrieval.loaders.youtube import YoutubeLoader
 
 # Web search engines
 from open_webui.apps.retrieval.web.main import SearchResult
 from open_webui.apps.retrieval.web.utils import get_web_loader
 from open_webui.apps.retrieval.web.brave import search_brave
+from open_webui.apps.retrieval.web.mojeek import search_mojeek
 from open_webui.apps.retrieval.web.duckduckgo import search_duckduckgo
 from open_webui.apps.retrieval.web.google_pse import search_google_pse
 from open_webui.apps.retrieval.web.jina_search import search_jina
@@ -52,6 +54,7 @@ from open_webui.apps.retrieval.utils import (
 from open_webui.apps.webui.models.files import Files
 from open_webui.config import (
     BRAVE_SEARCH_API_KEY,
+    MOJEEK_SEARCH_API_KEY,
     TIKTOKEN_ENCODING_NAME,
     RAG_TEXT_SPLITTER,
     CHUNK_OVERLAP,
@@ -102,6 +105,7 @@ from open_webui.config import (
     TIKA_SERVER_URL,
     UPLOAD_DIR,
     YOUTUBE_LOADER_LANGUAGE,
+    YOUTUBE_LOADER_PROXY_URL,
     DEFAULT_LOCALE,
     AppConfig,
 )
@@ -120,9 +124,6 @@ from open_webui.utils.misc import (
 from open_webui.utils.utils import get_admin_user, get_verified_user
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter, TokenTextSplitter
-from langchain_community.document_loaders import (
-    YoutubeLoader,
-)
 from langchain_core.documents import Document
 
 
@@ -171,6 +172,7 @@ app.state.config.OLLAMA_API_KEY = RAG_OLLAMA_API_KEY
 app.state.config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
 
 app.state.config.YOUTUBE_LOADER_LANGUAGE = YOUTUBE_LOADER_LANGUAGE
+app.state.config.YOUTUBE_LOADER_PROXY_URL = YOUTUBE_LOADER_PROXY_URL
 app.state.YOUTUBE_LOADER_TRANSLATION = None
 
 
@@ -182,6 +184,7 @@ app.state.config.SEARXNG_QUERY_URL = SEARXNG_QUERY_URL
 app.state.config.GOOGLE_PSE_API_KEY = GOOGLE_PSE_API_KEY
 app.state.config.GOOGLE_PSE_ENGINE_ID = GOOGLE_PSE_ENGINE_ID
 app.state.config.BRAVE_SEARCH_API_KEY = BRAVE_SEARCH_API_KEY
+app.state.config.MOJEEK_SEARCH_API_KEY = MOJEEK_SEARCH_API_KEY
 app.state.config.SERPSTACK_API_KEY = SERPSTACK_API_KEY
 app.state.config.SERPSTACK_HTTPS = SERPSTACK_HTTPS
 app.state.config.SERPER_API_KEY = SERPER_API_KEY
@@ -470,6 +473,7 @@ async def get_rag_config(user=Depends(get_admin_user)):
         "youtube": {
             "language": app.state.config.YOUTUBE_LOADER_LANGUAGE,
             "translation": app.state.YOUTUBE_LOADER_TRANSLATION,
+            "proxy_url": app.state.config.YOUTUBE_LOADER_PROXY_URL,
         },
         "web": {
             "web_loader_ssl_verification": app.state.config.ENABLE_RAG_WEB_LOADER_SSL_VERIFICATION,
@@ -480,6 +484,7 @@ async def get_rag_config(user=Depends(get_admin_user)):
                 "google_pse_api_key": app.state.config.GOOGLE_PSE_API_KEY,
                 "google_pse_engine_id": app.state.config.GOOGLE_PSE_ENGINE_ID,
                 "brave_search_api_key": app.state.config.BRAVE_SEARCH_API_KEY,
+                "mojeek_search_api_key": app.state.config.MOJEEK_SEARCH_API_KEY,
                 "serpstack_api_key": app.state.config.SERPSTACK_API_KEY,
                 "serpstack_https": app.state.config.SERPSTACK_HTTPS,
                 "serper_api_key": app.state.config.SERPER_API_KEY,
@@ -516,6 +521,7 @@ class ChunkParamUpdateForm(BaseModel):
 class YoutubeLoaderConfig(BaseModel):
     language: list[str]
     translation: Optional[str] = None
+    proxy_url: str = ""
 
 
 class WebSearchConfig(BaseModel):
@@ -525,6 +531,7 @@ class WebSearchConfig(BaseModel):
     google_pse_api_key: Optional[str] = None
     google_pse_engine_id: Optional[str] = None
     brave_search_api_key: Optional[str] = None
+    mojeek_search_api_key: Optional[str] = None
     serpstack_api_key: Optional[str] = None
     serpstack_https: Optional[bool] = None
     serper_api_key: Optional[str] = None
@@ -577,6 +584,7 @@ async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_
 
     if form_data.youtube is not None:
         app.state.config.YOUTUBE_LOADER_LANGUAGE = form_data.youtube.language
+        app.state.config.YOUTUBE_LOADER_PROXY_URL = form_data.youtube.proxy_url
         app.state.YOUTUBE_LOADER_TRANSLATION = form_data.youtube.translation
 
     if form_data.web is not None:
@@ -594,6 +602,9 @@ async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_
         )
         app.state.config.BRAVE_SEARCH_API_KEY = (
             form_data.web.search.brave_search_api_key
+        )
+        app.state.config.MOJEEK_SEARCH_API_KEY = (
+            form_data.web.search.mojeek_search_api_key
         )
         app.state.config.SERPSTACK_API_KEY = form_data.web.search.serpstack_api_key
         app.state.config.SERPSTACK_HTTPS = form_data.web.search.serpstack_https
@@ -634,6 +645,7 @@ async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_
         },
         "youtube": {
             "language": app.state.config.YOUTUBE_LOADER_LANGUAGE,
+            "proxy_url": app.state.config.YOUTUBE_LOADER_PROXY_URL,
             "translation": app.state.YOUTUBE_LOADER_TRANSLATION,
         },
         "web": {
@@ -645,6 +657,7 @@ async def update_rag_config(form_data: ConfigUpdateForm, user=Depends(get_admin_
                 "google_pse_api_key": app.state.config.GOOGLE_PSE_API_KEY,
                 "google_pse_engine_id": app.state.config.GOOGLE_PSE_ENGINE_ID,
                 "brave_search_api_key": app.state.config.BRAVE_SEARCH_API_KEY,
+                "mojeek_search_api_key": app.state.config.MOJEEK_SEARCH_API_KEY,
                 "serpstack_api_key": app.state.config.SERPSTACK_API_KEY,
                 "serpstack_https": app.state.config.SERPSTACK_HTTPS,
                 "serper_api_key": app.state.config.SERPER_API_KEY,
@@ -860,7 +873,7 @@ def save_docs_to_vector_db(
         return True
     except Exception as e:
         log.exception(e)
-        return False
+        raise e
 
 
 class ProcessFileForm(BaseModel):
@@ -886,19 +899,17 @@ def process_file(
             # Update the content in the file
             # Usage: /files/{file_id}/data/content/update
 
-            VECTOR_DB_CLIENT.delete(
-                collection_name=f"file-{file.id}",
-                filter={"file_id": file.id},
-            )
+            VECTOR_DB_CLIENT.delete_collection(collection_name=f"file-{file.id}")
 
             docs = [
                 Document(
-                    page_content=form_data.content,
+                    page_content=form_data.content.replace("<br/>", "\n"),
                     metadata={
-                        "name": file.meta.get("name", file.filename),
+                        **file.meta,
+                        "name": file.filename,
                         "created_by": file.user_id,
                         "file_id": file.id,
-                        **file.meta,
+                        "source": file.filename,
                     },
                 )
             ]
@@ -925,10 +936,11 @@ def process_file(
                     Document(
                         page_content=file.data.get("content", ""),
                         metadata={
-                            "name": file.meta.get("name", file.filename),
+                            **file.meta,
+                            "name": file.filename,
                             "created_by": file.user_id,
                             "file_id": file.id,
-                            **file.meta,
+                            "source": file.filename,
                         },
                     )
                 ]
@@ -948,15 +960,30 @@ def process_file(
                 docs = loader.load(
                     file.filename, file.meta.get("content_type"), file_path
                 )
+
+                docs = [
+                    Document(
+                        page_content=doc.page_content,
+                        metadata={
+                            **doc.metadata,
+                            "name": file.filename,
+                            "created_by": file.user_id,
+                            "file_id": file.id,
+                            "source": file.filename,
+                        },
+                    )
+                    for doc in docs
+                ]
             else:
                 docs = [
                     Document(
                         page_content=file.data.get("content", ""),
                         metadata={
+                            **file.meta,
                             "name": file.filename,
                             "created_by": file.user_id,
                             "file_id": file.id,
-                            **file.meta,
+                            "source": file.filename,
                         },
                     )
                 ]
@@ -977,7 +1004,7 @@ def process_file(
                 collection_name=collection_name,
                 metadata={
                     "file_id": file.id,
-                    "name": file.meta.get("name", file.filename),
+                    "name": file.filename,
                     "hash": hash,
                 },
                 add=(True if form_data.collection_name else False),
@@ -994,7 +1021,7 @@ def process_file(
                 return {
                     "status": True,
                     "collection_name": collection_name,
-                    "filename": file.meta.get("name", file.filename),
+                    "filename": file.filename,
                     "content": text_content,
                 }
         except Exception as e:
@@ -1059,12 +1086,12 @@ def process_youtube_video(form_data: ProcessUrlForm, user=Depends(get_verified_u
         if not collection_name:
             collection_name = calculate_sha256_string(form_data.url)[:63]
 
-        loader = YoutubeLoader.from_youtube_url(
+        loader = YoutubeLoader(
             form_data.url,
-            add_video_info=False,
             language=app.state.config.YOUTUBE_LOADER_LANGUAGE,
-            translation=app.state.YOUTUBE_LOADER_TRANSLATION,
+            proxy_url=app.state.config.YOUTUBE_LOADER_PROXY_URL,
         )
+
         docs = loader.load()
         content = " ".join([doc.page_content for doc in docs])
         log.debug(f"text_content: {content}")
@@ -1135,6 +1162,7 @@ def search_web(engine: str, query: str) -> list[SearchResult]:
     - SEARXNG_QUERY_URL
     - GOOGLE_PSE_API_KEY + GOOGLE_PSE_ENGINE_ID
     - BRAVE_SEARCH_API_KEY
+    - MOJEEK_SEARCH_API_KEY
     - SERPSTACK_API_KEY
     - SERPER_API_KEY
     - SERPLY_API_KEY
@@ -1181,6 +1209,16 @@ def search_web(engine: str, query: str) -> list[SearchResult]:
             )
         else:
             raise Exception("No BRAVE_SEARCH_API_KEY found in environment variables")
+    elif engine == "mojeek":
+        if app.state.config.MOJEEK_SEARCH_API_KEY:
+            return search_mojeek(
+                app.state.config.MOJEEK_SEARCH_API_KEY,
+                query,
+                app.state.config.RAG_WEB_SEARCH_RESULT_COUNT,
+                app.state.config.RAG_WEB_SEARCH_DOMAIN_FILTER_LIST,
+            )
+        else:
+            raise Exception("No MOJEEK_SEARCH_API_KEY found in environment variables")
     elif engine == "serpstack":
         if app.state.config.SERPSTACK_API_KEY:
             return search_serpstack(

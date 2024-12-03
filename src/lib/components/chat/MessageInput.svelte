@@ -18,7 +18,7 @@
 		showControls
 	} from '$lib/stores';
 
-	import { blobToFile, findWordIndices } from '$lib/utils';
+	import { blobToFile, createMessagesList, findWordIndices } from '$lib/utils';
 	import { transcribeAudio } from '$lib/apis/audio';
 	import { uploadFile } from '$lib/apis/files';
 	import { getTools } from '$lib/apis/tools';
@@ -34,6 +34,8 @@
 	import Commands from './MessageInput/Commands.svelte';
 	import XMark from '../icons/XMark.svelte';
 	import RichTextInput from '../common/RichTextInput.svelte';
+	import { generateAutoCompletion } from '$lib/apis';
+	import { error, text } from '@sveltejs/kit';
 
 	const i18n = getContext('i18n');
 
@@ -46,6 +48,9 @@
 
 	export let atSelectedModel: Model | undefined;
 	export let selectedModels: [''];
+
+	let selectedModelIds = [];
+	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
 
 	export let history;
 
@@ -74,14 +79,6 @@
 	$: visionCapableModels = [...(atSelectedModel ? [atSelectedModel] : selectedModels)].filter(
 		(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.vision ?? true
 	);
-
-	$: if (prompt) {
-		if (chatInputContainerElement) {
-			chatInputContainerElement.style.height = '';
-			chatInputContainerElement.style.height =
-				Math.min(chatInputContainerElement.scrollHeight, 200) + 'px';
-		}
-	}
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
@@ -275,7 +272,7 @@
 {#if loaded}
 	<div class="w-full font-primary">
 		<div class=" -mb-0.5 mx-auto inset-x-0 bg-transparent flex justify-center">
-			<div class="flex flex-col px-2.5 max-w-6xl w-full">
+			<div class="flex flex-col px-3 max-w-6xl w-full">
 				<div class="relative">
 					{#if autoScroll === false && history?.currentId}
 						<div
@@ -321,12 +318,22 @@
 												<span class="relative inline-flex rounded-full size-2 bg-yellow-500" />
 											</span>
 										</div>
-										<div class=" translate-y-[0.5px] line-clamp-1">
-											{selectedToolIds
-												.map((id) => {
-													return $tools ? $tools.find((tool) => tool.id === id)?.name : id;
-												})
-												.join(', ')}
+										<div class=" translate-y-[0.5px] text-ellipsis line-clamp-1 flex">
+											{#each selectedToolIds.map((id) => {
+												return $tools ? $tools.find((t) => t.id === id) : { id: id, name: id };
+											}) as tool, toolIdx (toolIdx)}
+												<Tooltip
+													content={tool?.meta?.description ?? ''}
+													className=" {toolIdx !== 0 ? 'pl-0.5' : ''} flex-shrink-0"
+													placement="top"
+												>
+													{tool.name}
+												</Tooltip>
+
+												{#if toolIdx !== selectedToolIds.length - 1}
+													<span>, </span>
+												{/if}
+											{/each}
 										</div>
 									</div>
 								</div>
@@ -403,7 +410,7 @@
 		</div>
 
 		<div class="{transparentBackground ? 'bg-transparent' : 'bg-white dark:bg-gray-900'} ">
-			<div class="max-w-6xl px-4 mx-auto inset-x-0">
+			<div class="max-w-6xl px-2.5 mx-auto inset-x-0">
 				<div class="">
 					<input
 						bind:this={filesInputElement}
@@ -455,7 +462,7 @@
 							}}
 						>
 							<div
-								class="flex-1 flex flex-col relative w-full rounded-3xl px-1.5 bg-gray-50 dark:bg-gray-850 dark:text-gray-100"
+								class="flex-1 flex flex-col relative w-full rounded-3xl px-1.5 bg-gray-50 dark:bg-gray-400/5 dark:text-gray-100"
 								dir={$settings?.chatDirection ?? 'LTR'}
 							>
 								{#if files.length > 0}
@@ -555,7 +562,7 @@
 											}}
 										>
 											<button
-												class="bg-gray-50 hover:bg-gray-100 text-gray-800 dark:bg-gray-850 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-2 outline-none focus:outline-none"
+												class="bg-transparent hover:bg-gray-100 text-gray-800 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-2 outline-none focus:outline-none"
 												type="button"
 												aria-label="More"
 											>
@@ -575,53 +582,45 @@
 
 									{#if $settings?.richTextInput ?? true}
 										<div
-											bind:this={chatInputContainerElement}
-											id="chat-input-container"
-											class="scrollbar-hidden text-left bg-gray-50 dark:bg-gray-850 dark:text-gray-100 outline-none w-full py-2.5 px-1 rounded-xl resize-none h-[48px] overflow-auto"
+											class="scrollbar-hidden text-left bg-transparent dark:text-gray-100 outline-none w-full py-2.5 px-1 rounded-xl resize-none h-fit max-h-80 overflow-auto"
 										>
 											<RichTextInput
 												bind:this={chatInputElement}
-												id="chat-input"
-												trim={true}
-												placeholder={placeholder ? placeholder : $i18n.t('Send a Message')}
-												largeTextAsFile={$settings?.largeTextAsFile ?? false}
 												bind:value={prompt}
+												id="chat-input"
+												messageInput={true}
 												shiftEnter={!$mobile ||
 													!(
 														'ontouchstart' in window ||
 														navigator.maxTouchPoints > 0 ||
 														navigator.msMaxTouchPoints > 0
 													)}
-												on:enter={async (e) => {
-													if (prompt !== '') {
-														dispatch('submit', prompt);
+												placeholder={placeholder ? placeholder : $i18n.t('Send a Message')}
+												largeTextAsFile={$settings?.largeTextAsFile ?? false}
+												autocomplete={true}
+												generateAutoCompletion={async (text) => {
+													if (selectedModelIds.length === 0 || !selectedModelIds.at(0)) {
+														toast.error($i18n.t('Please select a model first.'));
 													}
-												}}
-												on:input={async (e) => {
-													if (chatInputContainerElement) {
-														chatInputContainerElement.style.height = '';
-														chatInputContainerElement.style.height =
-															Math.min(chatInputContainerElement.scrollHeight, 200) + 'px';
-													}
-												}}
-												on:focus={async (e) => {
-													if (chatInputContainerElement) {
-														chatInputContainerElement.style.height = '';
-														chatInputContainerElement.style.height =
-															Math.min(chatInputContainerElement.scrollHeight, 200) + 'px';
-													}
-												}}
-												on:keypress={(e) => {
-													e = e.detail.event;
+
+													const res = await generateAutoCompletion(
+														localStorage.token,
+														selectedModelIds.at(0),
+														text,
+														history?.currentId
+															? createMessagesList(history, history.currentId)
+															: null
+													).catch((error) => {
+														console.log(error);
+
+														return null;
+													});
+
+													console.log(res);
+													return res;
 												}}
 												on:keydown={async (e) => {
 													e = e.detail.event;
-
-													if (chatInputContainerElement) {
-														chatInputContainerElement.style.height = '';
-														chatInputContainerElement.style.height =
-															Math.min(chatInputContainerElement.scrollHeight, 200) + 'px';
-													}
 
 													const isCtrlPressed = e.ctrlKey || e.metaKey; // metaKey is for Cmd key on Mac
 													const commandsContainerElement =
@@ -662,50 +661,70 @@
 														editButton?.click();
 													}
 
-													if (commandsContainerElement && e.key === 'ArrowUp') {
-														e.preventDefault();
-														commandsElement.selectUp();
+													if (commandsContainerElement) {
+														if (commandsContainerElement && e.key === 'ArrowUp') {
+															e.preventDefault();
+															commandsElement.selectUp();
 
-														const commandOptionButton = [
-															...document.getElementsByClassName('selected-command-option-button')
-														]?.at(-1);
-														commandOptionButton.scrollIntoView({ block: 'center' });
-													}
-
-													if (commandsContainerElement && e.key === 'ArrowDown') {
-														e.preventDefault();
-														commandsElement.selectDown();
-
-														const commandOptionButton = [
-															...document.getElementsByClassName('selected-command-option-button')
-														]?.at(-1);
-														commandOptionButton.scrollIntoView({ block: 'center' });
-													}
-
-													if (commandsContainerElement && e.key === 'Enter') {
-														e.preventDefault();
-
-														const commandOptionButton = [
-															...document.getElementsByClassName('selected-command-option-button')
-														]?.at(-1);
-
-														if (e.shiftKey) {
-															prompt = `${prompt}\n`;
-														} else if (commandOptionButton) {
-															commandOptionButton?.click();
-														} else {
-															document.getElementById('send-message-button')?.click();
+															const commandOptionButton = [
+																...document.getElementsByClassName('selected-command-option-button')
+															]?.at(-1);
+															commandOptionButton.scrollIntoView({ block: 'center' });
 														}
-													}
 
-													if (commandsContainerElement && e.key === 'Tab') {
-														e.preventDefault();
+														if (commandsContainerElement && e.key === 'ArrowDown') {
+															e.preventDefault();
+															commandsElement.selectDown();
 
-														const commandOptionButton = [
-															...document.getElementsByClassName('selected-command-option-button')
-														]?.at(-1);
+															const commandOptionButton = [
+																...document.getElementsByClassName('selected-command-option-button')
+															]?.at(-1);
+															commandOptionButton.scrollIntoView({ block: 'center' });
+														}
 
-														commandOptionButton?.click();
+														if (commandsContainerElement && e.key === 'Tab') {
+															e.preventDefault();
+
+															const commandOptionButton = [
+																...document.getElementsByClassName('selected-command-option-button')
+															]?.at(-1);
+
+															commandOptionButton?.click();
+														}
+
+														if (commandsContainerElement && e.key === 'Enter') {
+															e.preventDefault();
+
+															const commandOptionButton = [
+																...document.getElementsByClassName('selected-command-option-button')
+															]?.at(-1);
+
+															if (commandOptionButton) {
+																commandOptionButton?.click();
+															} else {
+																document.getElementById('send-message-button')?.click();
+															}
+														}
+													} else {
+														if (
+															!$mobile ||
+															!(
+																'ontouchstart' in window ||
+																navigator.maxTouchPoints > 0 ||
+																navigator.msMaxTouchPoints > 0
+															)
+														) {
+															// Prevent Enter key from creating a new line
+															// Uses keyCode '13' for Enter key for chinese/japanese keyboards
+															if (e.keyCode === 13 && !e.shiftKey) {
+																e.preventDefault();
+															}
+
+															// Submit the prompt when Enter key is pressed
+															if (prompt !== '' && e.keyCode === 13 && !e.shiftKey) {
+																dispatch('submit', prompt);
+															}
+														}
 													}
 
 													if (e.key === 'Escape') {
@@ -888,7 +907,7 @@
 													}
 
 													e.target.style.height = '';
-													e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
+													e.target.style.height = Math.min(e.target.scrollHeight, 320) + 'px';
 												}
 
 												if (e.key === 'Escape') {
@@ -901,12 +920,11 @@
 											rows="1"
 											on:input={async (e) => {
 												e.target.style.height = '';
-												e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
-												user = null;
+												e.target.style.height = Math.min(e.target.scrollHeight, 320) + 'px';
 											}}
 											on:focus={async (e) => {
 												e.target.style.height = '';
-												e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
+												e.target.style.height = Math.min(e.target.scrollHeight, 320) + 'px';
 											}}
 											on:paste={async (e) => {
 												const clipboardData = e.clipboardData || window.clipboardData;

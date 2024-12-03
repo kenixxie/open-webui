@@ -49,7 +49,9 @@ from open_webui.apps.openai.main import (
     get_all_models_responses as get_openai_models_responses,
 )
 from open_webui.apps.retrieval.main import app as retrieval_app
-from open_webui.apps.retrieval.utils import get_rag_context, rag_template
+from open_webui.apps.retrieval.utils import get_sources_from_files
+
+
 from open_webui.apps.socket.main import (
     app as socket_app,
     periodic_usage_pool_cleanup,
@@ -87,6 +89,10 @@ from open_webui.config import (
     DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE,
     TITLE_GENERATION_PROMPT_TEMPLATE,
     TAGS_GENERATION_PROMPT_TEMPLATE,
+    ENABLE_AUTOCOMPLETE_GENERATION,
+    AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH,
+    AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
     TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
     WEBHOOK_URL,
     WEBUI_AUTH,
@@ -122,11 +128,13 @@ from open_webui.utils.response import (
 )
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.task import (
-    moa_response_generation_template,
-    tags_generation_template,
-    query_generation_template,
-    emoji_generation_template,
+    rag_template,
     title_generation_template,
+    query_generation_template,
+    autocomplete_generation_template,
+    tags_generation_template,
+    emoji_generation_template,
+    moa_response_generation_template,
     tools_function_calling_generation_template,
 )
 from open_webui.utils.tools import get_tools
@@ -204,6 +212,11 @@ app.state.config.TASK_MODEL_EXTERNAL = TASK_MODEL_EXTERNAL
 
 app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = TITLE_GENERATION_PROMPT_TEMPLATE
 
+app.state.config.ENABLE_AUTOCOMPLETE_GENERATION = ENABLE_AUTOCOMPLETE_GENERATION
+app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH = (
+    AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH
+)
+
 app.state.config.ENABLE_TAGS_GENERATION = ENABLE_TAGS_GENERATION
 app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE = TAGS_GENERATION_PROMPT_TEMPLATE
 
@@ -211,6 +224,10 @@ app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE = TAGS_GENERATION_PROMPT_TEMPLA
 app.state.config.ENABLE_SEARCH_QUERY_GENERATION = ENABLE_SEARCH_QUERY_GENERATION
 app.state.config.ENABLE_RETRIEVAL_QUERY_GENERATION = ENABLE_RETRIEVAL_QUERY_GENERATION
 app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE = QUERY_GENERATION_PROMPT_TEMPLATE
+
+app.state.config.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE = (
+    AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE
+)
 
 app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
     TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
@@ -380,8 +397,7 @@ async def chat_completion_tools_handler(
         return body, {}
 
     skip_files = False
-    contexts = []
-    citations = []
+    sources = []
 
     task_model_id = get_task_model_id(
         body["model"],
@@ -463,21 +479,39 @@ async def chat_completion_tools_handler(
             except Exception as e:
                 tool_output = str(e)
 
-            if tools[tool_function_name]["citation"]:
-                citations.append(
-                    {
-                        "source": {
-                            "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
-                        },
-                        "document": [tool_output],
-                        "metadata": [{"source": tool_function_name}],
-                    }
-                )
-            if tools[tool_function_name]["file_handler"]:
-                skip_files = True
+            print(tools[tool_function_name]["citation"])
 
             if isinstance(tool_output, str):
-                contexts.append(tool_output)
+                if tools[tool_function_name]["citation"]:
+                    sources.append(
+                        {
+                            "source": {
+                                "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                            },
+                            "document": [tool_output],
+                            "metadata": [
+                                {
+                                    "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    sources.append(
+                        {
+                            "source": {},
+                            "document": [tool_output],
+                            "metadata": [
+                                {
+                                    "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                                }
+                            ],
+                        }
+                    )
+
+                if tools[tool_function_name]["file_handler"]:
+                    skip_files = True
+
         except Exception as e:
             log.exception(f"Error: {e}")
             content = None
@@ -485,47 +519,51 @@ async def chat_completion_tools_handler(
         log.exception(f"Error: {e}")
         content = None
 
-    log.debug(f"tool_contexts: {contexts}")
+    log.debug(f"tool_contexts: {sources}")
 
     if skip_files and "files" in body.get("metadata", {}):
         del body["metadata"]["files"]
 
-    return body, {"contexts": contexts, "citations": citations}
+    return body, {"sources": sources}
 
 
 async def chat_completion_files_handler(
     body: dict, user: UserModel
 ) -> tuple[dict, dict[str, list]]:
-    contexts = []
-    citations = []
-
-    try:
-        queries_response = await generate_queries(
-            {
-                "model": body["model"],
-                "messages": body["messages"],
-                "type": "retrieval",
-            },
-            user,
-        )
-        queries_response = queries_response["choices"][0]["message"]["content"]
-
-        try:
-            queries_response = json.loads(queries_response)
-        except Exception as e:
-            queries_response = {"queries": []}
-
-        queries = queries_response.get("queries", [])
-    except Exception as e:
-        queries = []
-
-    if len(queries) == 0:
-        queries = [get_last_user_message(body["messages"])]
-
-    print(f"{queries=}")
+    sources = []
 
     if files := body.get("metadata", {}).get("files", None):
-        contexts, citations = get_rag_context(
+        try:
+            queries_response = await generate_queries(
+                {
+                    "model": body["model"],
+                    "messages": body["messages"],
+                    "type": "retrieval",
+                },
+                user,
+            )
+            queries_response = queries_response["choices"][0]["message"]["content"]
+
+            try:
+                bracket_start = queries_response.find("{")
+                bracket_end = queries_response.rfind("}") + 1
+
+                if bracket_start == -1 or bracket_end == -1:
+                    raise Exception("No JSON object found in the response")
+
+                queries_response = queries_response[bracket_start:bracket_end]
+                queries_response = json.loads(queries_response)
+            except Exception as e:
+                queries_response = {"queries": [queries_response]}
+
+            queries = queries_response.get("queries", [])
+        except Exception as e:
+            queries = []
+
+        if len(queries) == 0:
+            queries = [get_last_user_message(body["messages"])]
+
+        sources = get_sources_from_files(
             files=files,
             queries=queries,
             embedding_function=retrieval_app.state.EMBEDDING_FUNCTION,
@@ -535,9 +573,8 @@ async def chat_completion_files_handler(
             hybrid_search=retrieval_app.state.config.ENABLE_RAG_HYBRID_SEARCH,
         )
 
-        log.debug(f"rag_contexts: {contexts}, citations: {citations}")
-
-    return body, {"contexts": contexts, "citations": citations}
+        log.debug(f"rag_contexts:sources: {sources}")
+    return body, {"sources": sources}
 
 
 def is_chat_completion_request(request):
@@ -638,8 +675,7 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
         # Initialize data_items to store additional data to be sent to the client
         # Initialize contexts and citation
         data_items = []
-        contexts = []
-        citations = []
+        sources = []
 
         try:
             body, flags = await chat_completion_filter_functions_handler(
@@ -665,21 +701,37 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
             body, flags = await chat_completion_tools_handler(
                 body, user, models, extra_params
             )
-            contexts.extend(flags.get("contexts", []))
-            citations.extend(flags.get("citations", []))
+            sources.extend(flags.get("sources", []))
         except Exception as e:
             log.exception(e)
 
         try:
             body, flags = await chat_completion_files_handler(body, user)
-            contexts.extend(flags.get("contexts", []))
-            citations.extend(flags.get("citations", []))
+            sources.extend(flags.get("sources", []))
         except Exception as e:
             log.exception(e)
 
         # If context is not empty, insert it into the messages
-        if len(contexts) > 0:
-            context_string = "/n".join(contexts).strip()
+        if len(sources) > 0:
+            context_string = ""
+            for source_idx, source in enumerate(sources):
+                source_id = source.get("source", {}).get("name", "")
+
+                if "document" in source:
+                    for doc_idx, doc_context in enumerate(source["document"]):
+                        metadata = source.get("metadata")
+                        doc_source_id = None
+
+                        if metadata:
+                            doc_source_id = metadata[doc_idx].get("source", source_id)
+
+                        if source_id:
+                            context_string += f"<source><source_id>{doc_source_id if doc_source_id is not None else source_id}</source_id><source_context>{doc_context}</source_context></source>\n"
+                        else:
+                            # If there is no source_id, then do not include the source_id tag
+                            context_string += f"<source><source_context>{doc_context}</source_context></source>\n"
+
+            context_string = context_string.strip()
             prompt = get_last_user_message(body["messages"])
 
             if prompt is None:
@@ -710,8 +762,11 @@ class ChatCompletionMiddleware(BaseHTTPMiddleware):
                 )
 
         # If there are citations, add them to the data_items
-        if len(citations) > 0:
-            data_items.append({"citations": citations})
+        sources = [
+            source for source in sources if source.get("source", {}).get("name", "")
+        ]
+        if len(sources) > 0:
+            data_items.append({"sources": sources})
 
         modified_body_bytes = json.dumps(body).encode("utf-8")
         # Replace the request body with the modified one
@@ -855,6 +910,11 @@ class PipelineMiddleware(BaseHTTPMiddleware):
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     content={"detail": "Not authenticated"},
                 )
+        except HTTPException as e:
+            return JSONResponse(
+                status_code=e.status_code,
+                content={"detail": e.detail},
+            )
 
         model_list = await get_all_models()
         models = {model["id"]: model for model in model_list}
@@ -932,7 +992,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 @app.middleware("http")
 async def commit_session_after_request(request: Request, call_next):
     response = await call_next(request)
-    log.debug("Commit session after request")
+    # log.debug("Commit session after request")
     Session.commit()
     return response
 
@@ -1015,7 +1075,7 @@ async def get_all_base_models():
     return models
 
 
-@cached(ttl=1)
+@cached(ttl=3)
 async def get_all_models():
     models = await get_all_base_models()
 
@@ -1139,6 +1199,8 @@ async def get_all_models():
             model["actions"].extend(
                 get_action_items_from_module(action_function, function_module)
             )
+    log.debug(f"get_all_models() returned {len(models)} models")
+
     return models
 
 
@@ -1152,6 +1214,14 @@ async def get_models(user=Depends(get_verified_user)):
         for model in models
         if "pipeline" not in model or model["pipeline"].get("type", None) != "filter"
     ]
+
+    model_order_list = webui_app.state.config.MODEL_ORDER_LIST
+    if model_order_list:
+        model_order_dict = {model_id: i for i, model_id in enumerate(model_order_list)}
+        # Sort models by order list priority, with fallback for those not in the list
+        models.sort(
+            key=lambda x: (model_order_dict.get(x["id"], float("inf")), x["name"])
+        )
 
     # Filter out models that the user does not have access to
     if user.role == "user":
@@ -1175,6 +1245,10 @@ async def get_models(user=Depends(get_verified_user)):
                 ):
                     filtered_models.append(model)
         models = filtered_models
+
+    log.debug(
+        f"/api/models returned filtered models accessible to the user: {json.dumps([model['id'] for model in models])}"
+    )
 
     return {"data": models}
 
@@ -1308,7 +1382,6 @@ async def generate_chat_completions(
 
 @app.post("/api/chat/completed")
 async def chat_completed(form_data: dict, user=Depends(get_verified_user)):
-
     model_list = await get_all_models()
     models = {model["id"]: model for model in model_list}
 
@@ -1606,6 +1679,8 @@ async def get_task_config(user=Depends(get_verified_user)):
         "TASK_MODEL": app.state.config.TASK_MODEL,
         "TASK_MODEL_EXTERNAL": app.state.config.TASK_MODEL_EXTERNAL,
         "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
+        "ENABLE_AUTOCOMPLETE_GENERATION": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
+        "AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH": app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH,
         "TAGS_GENERATION_PROMPT_TEMPLATE": app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE,
         "ENABLE_TAGS_GENERATION": app.state.config.ENABLE_TAGS_GENERATION,
         "ENABLE_SEARCH_QUERY_GENERATION": app.state.config.ENABLE_SEARCH_QUERY_GENERATION,
@@ -1619,6 +1694,8 @@ class TaskConfigForm(BaseModel):
     TASK_MODEL: Optional[str]
     TASK_MODEL_EXTERNAL: Optional[str]
     TITLE_GENERATION_PROMPT_TEMPLATE: str
+    ENABLE_AUTOCOMPLETE_GENERATION: bool
+    AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH: int
     TAGS_GENERATION_PROMPT_TEMPLATE: str
     ENABLE_TAGS_GENERATION: bool
     ENABLE_SEARCH_QUERY_GENERATION: bool
@@ -1634,6 +1711,14 @@ async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_u
     app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE = (
         form_data.TITLE_GENERATION_PROMPT_TEMPLATE
     )
+
+    app.state.config.ENABLE_AUTOCOMPLETE_GENERATION = (
+        form_data.ENABLE_AUTOCOMPLETE_GENERATION
+    )
+    app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH = (
+        form_data.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH
+    )
+
     app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE = (
         form_data.TAGS_GENERATION_PROMPT_TEMPLATE
     )
@@ -1656,6 +1741,8 @@ async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_u
         "TASK_MODEL": app.state.config.TASK_MODEL,
         "TASK_MODEL_EXTERNAL": app.state.config.TASK_MODEL_EXTERNAL,
         "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
+        "ENABLE_AUTOCOMPLETE_GENERATION": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
+        "AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH": app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH,
         "TAGS_GENERATION_PROMPT_TEMPLATE": app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE,
         "ENABLE_TAGS_GENERATION": app.state.config.ENABLE_TAGS_GENERATION,
         "ENABLE_SEARCH_QUERY_GENERATION": app.state.config.ENABLE_SEARCH_QUERY_GENERATION,
@@ -1667,7 +1754,6 @@ async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_u
 
 @app.post("/api/task/title/completions")
 async def generate_title(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_title")
 
     model_list = await get_all_models()
     models = {model["id"]: model for model in model_list}
@@ -1688,9 +1774,9 @@ async def generate_title(form_data: dict, user=Depends(get_verified_user)):
         models,
     )
 
-    print(task_model_id)
-
-    model = models[task_model_id]
+    log.debug(
+        f"generating chat title using model {task_model_id} for user {user.email} "
+    )
 
     if app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE != "":
         template = app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE
@@ -1729,10 +1815,12 @@ Artificial Intelligence in Healthcare
                 "max_completion_tokens": 50,
             }
         ),
-        "chat_id": form_data.get("chat_id", None),
-        "metadata": {"task": str(TASKS.TITLE_GENERATION), "task_body": form_data},
+        "metadata": {
+            "task": str(TASKS.TITLE_GENERATION),
+            "task_body": form_data,
+            "chat_id": form_data.get("chat_id", None),
+        },
     }
-    log.debug(payload)
 
     # Handle pipeline filters
     try:
@@ -1756,7 +1844,7 @@ Artificial Intelligence in Healthcare
 
 @app.post("/api/task/tags/completions")
 async def generate_chat_tags(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_chat_tags")
+
     if not app.state.config.ENABLE_TAGS_GENERATION:
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -1781,7 +1869,10 @@ async def generate_chat_tags(form_data: dict, user=Depends(get_verified_user)):
         app.state.config.TASK_MODEL_EXTERNAL,
         models,
     )
-    print(task_model_id)
+
+    log.debug(
+        f"generating chat tags using model {task_model_id} for user {user.email} "
+    )
 
     if app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE != "":
         template = app.state.config.TAGS_GENERATION_PROMPT_TEMPLATE
@@ -1812,9 +1903,12 @@ JSON format: { "tags": ["tag1", "tag2", "tag3"] }
         "model": task_model_id,
         "messages": [{"role": "user", "content": content}],
         "stream": False,
-        "metadata": {"task": str(TASKS.TAGS_GENERATION), "task_body": form_data},
+        "metadata": {
+            "task": str(TASKS.TAGS_GENERATION),
+            "task_body": form_data,
+            "chat_id": form_data.get("chat_id", None),
+        },
     }
-    log.debug(payload)
 
     # Handle pipeline filters
     try:
@@ -1838,7 +1932,7 @@ JSON format: { "tags": ["tag1", "tag2", "tag3"] }
 
 @app.post("/api/task/queries/completions")
 async def generate_queries(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_queries")
+
     type = form_data.get("type")
     if type == "web_search":
         if not app.state.config.ENABLE_SEARCH_QUERY_GENERATION:
@@ -1871,11 +1965,12 @@ async def generate_queries(form_data: dict, user=Depends(get_verified_user)):
         app.state.config.TASK_MODEL_EXTERNAL,
         models,
     )
-    print(task_model_id)
 
-    model = models[task_model_id]
+    log.debug(
+        f"generating {type} queries using model {task_model_id} for user {user.email}"
+    )
 
-    if app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE != "":
+    if (app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE).strip() != "":
         template = app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE
     else:
         template = DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE
@@ -1888,9 +1983,96 @@ async def generate_queries(form_data: dict, user=Depends(get_verified_user)):
         "model": task_model_id,
         "messages": [{"role": "user", "content": content}],
         "stream": False,
-        "metadata": {"task": str(TASKS.QUERY_GENERATION), "task_body": form_data},
+        "metadata": {
+            "task": str(TASKS.QUERY_GENERATION),
+            "task_body": form_data,
+            "chat_id": form_data.get("chat_id", None),
+        },
     }
-    log.debug(payload)
+
+    # Handle pipeline filters
+    try:
+        payload = filter_pipeline(payload, user, models)
+    except Exception as e:
+        if len(e.args) > 1:
+            return JSONResponse(
+                status_code=e.args[0],
+                content={"detail": e.args[1]},
+            )
+        else:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": str(e)},
+            )
+    if "chat_id" in payload:
+        del payload["chat_id"]
+
+    return await generate_chat_completions(form_data=payload, user=user)
+
+
+@app.post("/api/task/auto/completions")
+async def generate_autocompletion(form_data: dict, user=Depends(get_verified_user)):
+    if not app.state.config.ENABLE_AUTOCOMPLETE_GENERATION:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Autocompletion generation is disabled",
+        )
+
+    type = form_data.get("type")
+    prompt = form_data.get("prompt")
+    messages = form_data.get("messages")
+
+    if app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH > 0:
+        if len(prompt) > app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Input prompt exceeds maximum length of {app.state.config.AUTOCOMPLETE_GENERATION_INPUT_MAX_LENGTH}",
+            )
+
+    model_list = await get_all_models()
+    models = {model["id"]: model for model in model_list}
+
+    model_id = form_data["model"]
+    if model_id not in models:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found",
+        )
+
+    # Check if the user has a custom task model
+    # If the user has a custom task model, use that model
+    task_model_id = get_task_model_id(
+        model_id,
+        app.state.config.TASK_MODEL,
+        app.state.config.TASK_MODEL_EXTERNAL,
+        models,
+    )
+
+    log.debug(
+        f"generating autocompletion using model {task_model_id} for user {user.email}"
+    )
+
+    if (app.state.config.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE).strip() != "":
+        template = app.state.config.AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE
+    else:
+        template = DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE
+
+    content = autocomplete_generation_template(
+        template, prompt, messages, type, {"name": user.name}
+    )
+
+    payload = {
+        "model": task_model_id,
+        "messages": [{"role": "user", "content": content}],
+        "stream": False,
+        "metadata": {
+            "task": str(TASKS.AUTOCOMPLETE_GENERATION),
+            "task_body": form_data,
+            "chat_id": form_data.get("chat_id", None),
+        },
+    }
+
+    print(payload)
 
     # Handle pipeline filters
     try:
@@ -1914,7 +2096,6 @@ async def generate_queries(form_data: dict, user=Depends(get_verified_user)):
 
 @app.post("/api/task/emoji/completions")
 async def generate_emoji(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_emoji")
 
     model_list = await get_all_models()
     models = {model["id"]: model for model in model_list}
@@ -1934,9 +2115,8 @@ async def generate_emoji(form_data: dict, user=Depends(get_verified_user)):
         app.state.config.TASK_MODEL_EXTERNAL,
         models,
     )
-    print(task_model_id)
 
-    model = models[task_model_id]
+    log.debug(f"generating emoji using model {task_model_id} for user {user.email} ")
 
     template = '''
 Your task is to reflect the speaker's likely facial expression through a fitting emoji. Interpret emotions from the message and reflect their facial expression using fitting, diverse emojis (e.g., 😊, 😢, 😡, 😱).
@@ -1966,7 +2146,6 @@ Message: """{{prompt}}"""
         "chat_id": form_data.get("chat_id", None),
         "metadata": {"task": str(TASKS.EMOJI_GENERATION), "task_body": form_data},
     }
-    log.debug(payload)
 
     # Handle pipeline filters
     try:
@@ -1990,7 +2169,6 @@ Message: """{{prompt}}"""
 
 @app.post("/api/task/moa/completions")
 async def generate_moa_response(form_data: dict, user=Depends(get_verified_user)):
-    print("generate_moa_response")
 
     model_list = await get_all_models()
     models = {model["id"]: model for model in model_list}
@@ -2010,9 +2188,8 @@ async def generate_moa_response(form_data: dict, user=Depends(get_verified_user)
         app.state.config.TASK_MODEL_EXTERNAL,
         models,
     )
-    print(task_model_id)
 
-    model = models[task_model_id]
+    log.debug(f"generating MOA model {task_model_id} for user {user.email} ")
 
     template = """You have been provided with a set of responses from various models to the latest user query: "{{prompt}}"
 
@@ -2036,7 +2213,6 @@ Responses from models: {{responses}}"""
             "task_body": form_data,
         },
     }
-    log.debug(payload)
 
     try:
         payload = filter_pipeline(payload, user, models)
@@ -2071,7 +2247,7 @@ Responses from models: {{responses}}"""
 async def get_pipelines_list(user=Depends(get_admin_user)):
     responses = await get_openai_models_responses()
 
-    print(responses)
+    log.debug(f"get_pipelines_list: get_openai_models_responses returned {responses}")
     urlIdxs = [
         idx
         for idx, response in enumerate(responses)
