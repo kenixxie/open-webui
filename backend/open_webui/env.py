@@ -113,6 +113,7 @@ if WEBUI_NAME != "产互大模型":
 
 WEBUI_FAVICON_URL = "https://openwebui.com/favicon.png"
 
+TRUSTED_SIGNATURE_KEY = os.environ.get("TRUSTED_SIGNATURE_KEY", "")
 
 ####################################
 # ENV (dev,test,prod)
